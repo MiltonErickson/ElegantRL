@@ -1,40 +1,72 @@
 import os
+import math
 import torch
-import numpy as np
-import numpy.random as rd
+from typing import Tuple
 from torch import Tensor
 
-'''[ElegantRL.2022.12.12](github.com/AI4Fiance-Foundation/ElegantRL)'''
+from elegantrl.train.config import Config
 
 
-class ReplayBuffer:  # for off-policy, vectorized env
+class ReplayBuffer:  # for off-policy
     def __init__(self,
                  max_size: int,
                  state_dim: int,
                  action_dim: int,
                  gpu_id: int = 0,
-                 num_envs: int = 1,
-                 if_use_per: bool = False):
+                 num_seqs: int = 1,
+                 if_use_per: bool = False,
+                 args: Config = Config()):
         self.p = 0  # pointer
         self.if_full = False
         self.cur_size = 0
         self.add_size = 0
         self.add_item = None
         self.max_size = max_size
-        self.num_envs = num_envs
+        self.num_seqs = num_seqs
         self.device = torch.device(f"cuda:{gpu_id}" if (torch.cuda.is_available() and (gpu_id >= 0)) else "cpu")
 
-        self.states = torch.empty((max_size, num_envs, state_dim), dtype=torch.float32, device=self.device)
-        self.actions = torch.empty((max_size, num_envs, action_dim), dtype=torch.float32, device=self.device)
-        self.rewards = torch.empty((max_size, num_envs), dtype=torch.float32, device=self.device)
-        self.undones = torch.empty((max_size, num_envs), dtype=torch.float32, device=self.device)
+        """The struction of ReplayBuffer (for example, num_seqs = num_workers * num_envs == 2*4 = 8
+        ReplayBuffer:
+        worker0 for env0:   sequence of sub_env0.0  self.states  = Tensor[s, s, ..., s, ..., s]     
+                                                    self.actions = Tensor[a, a, ..., a, ..., a]   
+                                                    self.rewards = Tensor[r, r, ..., r, ..., r]   
+                                                    self.undones = Tensor[d, d, ..., d, ..., d]
+                                                                          <-----max_size----->
+                                                                          <-cur_size->
+                                                                                     ↑ pointer
+                            sequence of sub_env0.1  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+                            sequence of sub_env0.2  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+                            sequence of sub_env0.3  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+        worker1 for env1:   sequence of sub_env1.0  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+                            sequence of sub_env1.1  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+                            sequence of sub_env1.2  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+                            sequence of sub_env1.3  s, s, ..., s    a, a, ..., a    r, r, ..., r    d, d, ..., d
+        
+        D: done=True
+        d: done=False
+        sequence of transition: s-a-r-d, s-a-r-d, s-a-r-D  s-a-r-d, s-a-r-d, s-a-r-d, s-a-r-d, s-a-r-D  s-a-r-d, ...
+                                <------trajectory------->  <----------trajectory--------------------->  <-----------
+        """
+        self.states = torch.empty((max_size, num_seqs, state_dim), dtype=torch.float32, device=self.device)
+        self.actions = torch.empty((max_size, num_seqs, action_dim), dtype=torch.float32, device=self.device)
+        self.rewards = torch.empty((max_size, num_seqs), dtype=torch.float32, device=self.device)
+        self.undones = torch.empty((max_size, num_seqs), dtype=torch.float32, device=self.device)
 
         self.if_use_per = if_use_per
         if if_use_per:
-            self.per_tree = BinarySearchTree(max_size * num_envs)
-            self.sample = self.sample_per
+            self.sum_trees = [SumTree(buf_len=max_size) for _ in range(num_seqs)]
+            self.per_alpha = getattr(args, 'per_alpha', 0.6)  # alpha = (Uniform:0, Greedy:1)
+            self.per_beta = getattr(args, 'per_beta', 0.4)  # alpha = (Uniform:0, Greedy:1)
+            """PER.  Prioritized Experience Replay. Section 4
+            alpha, beta = 0.7, 0.5 for rank-based variant
+            alpha, beta = 0.6, 0.4 for proportional variant
+            """
+        else:
+            self.sum_trees = None
+            self.per_alpha = None
+            self.per_beta = None
 
-    def update(self, items: [Tensor]):
+    def update(self, items: Tuple[Tensor, ...]):
         self.add_item = items
         states, actions, rewards, undones = items
         # assert states.shape[1:] == (env_num, state_dim)
@@ -61,13 +93,23 @@ class ReplayBuffer:  # for off-policy, vectorized env
             self.rewards[self.p:p] = rewards
             self.undones[self.p:p] = undones
 
+        if self.if_use_per:
+            '''data_ids for single env'''
+            data_ids = torch.arange(self.p, p, dtype=torch.long, device=self.device)
+            if p > self.max_size:
+                data_ids = torch.fmod(data_ids, self.max_size)
+
+            '''apply data_ids for vectorized env'''
+            for sum_tree in self.sum_trees:
+                sum_tree.update_ids(data_ids=data_ids.cpu(), prob=10.)
+
         self.p = p
         self.cur_size = self.max_size if self.if_full else self.p
 
-    def sample(self, batch_size: int) -> (Tensor, Tensor, Tensor, Tensor, Tensor):
+    def sample(self, batch_size: int) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         sample_len = self.cur_size - 1
 
-        ids = torch.randint(sample_len * self.num_envs, size=(batch_size,), requires_grad=False)
+        ids = torch.randint(sample_len * self.num_seqs, size=(batch_size,), requires_grad=False)
         ids0 = torch.fmod(ids, sample_len)  # ids % sample_len
         ids1 = torch.div(ids, sample_len, rounding_mode='floor')  # ids // sample_len
 
@@ -77,25 +119,49 @@ class ReplayBuffer:  # for off-policy, vectorized env
                 self.undones[ids0, ids1],
                 self.states[ids0 + 1, ids1],)  # next_state
 
-    def sample_per(self, batch_size: int) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor):
+    def sample_for_per(self, batch_size: int) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         beg = -self.max_size
         end = (self.cur_size - self.max_size) if (self.cur_size < self.max_size) else -1
 
-        ids, is_weights = self.per_tree.get_indices_is_weights(batch_size, beg, end)
-        is_weights = torch.as_tensor(is_weights, dtype=torch.float32, device=self.device)  # important sampling weights
+        '''get is_indices, is_weights'''
+        is_indices: list = []
+        is_weights: list = []
 
-        ids0 = torch.fmod(ids, self.cur_size)  # ids % sample_len
-        ids1 = torch.div(ids, self.cur_size, rounding_mode='floor')  # ids // sample_len
+        assert batch_size % self.num_seqs == 0
+        sub_batch_size = batch_size // self.num_seqs
+        for env_i in range(self.num_seqs):
+            sum_tree = self.sum_trees[env_i]
+            _is_indices, _is_weights = sum_tree.important_sampling(batch_size, beg, end, self.per_beta)
+            is_indices.append(_is_indices + sub_batch_size * env_i)
+            is_weights.append(_is_weights)
 
-        return (self.states[ids0, ids1],
-                self.actions[ids0, ids1],
-                self.rewards[ids0, ids1],
-                self.undones[ids0, ids1],
-                self.states[ids0 + 1, ids1],  # next_state
-                is_weights)
+        is_indices: Tensor = torch.hstack(is_indices).to(self.device)
+        is_weights: Tensor = torch.hstack(is_weights).to(self.device)
 
-    def td_error_update(self, td_error: Tensor):
-        self.per_tree.td_error_update(td_error)
+        ids0 = torch.fmod(is_indices, self.cur_size)  # is_indices % sample_len
+        ids1 = torch.div(is_indices, self.cur_size, rounding_mode='floor')  # is_indices // sample_len
+        return (
+            self.states[ids0, ids1],
+            self.actions[ids0, ids1],
+            self.rewards[ids0, ids1],
+            self.undones[ids0, ids1],
+            self.states[ids0 + 1, ids1],  # next_state
+            is_weights,  # important sampling weights
+            is_indices,  # important sampling indices
+        )
+
+    def td_error_update_for_per(self, is_indices: Tensor, td_error: Tensor):  # td_error = (q-q).detach_().abs()
+        prob = td_error.clamp(1e-8, 10).pow(self.per_alpha)
+
+        # self.sum_tree.update_ids(is_indices.cpu(), prob.cpu())
+        batch_size = td_error.shape[0]
+        sub_batch_size = batch_size // self.num_seqs
+        for env_i in range(self.num_seqs):
+            sum_tree = self.sum_trees[env_i]
+            slice_i = env_i * sub_batch_size
+            slice_j = slice_i + sub_batch_size
+
+            sum_tree.update_ids(is_indices[slice_i:slice_j].cpu(), prob[slice_i:slice_j].cpu())
 
     def save_or_load_history(self, cwd: str, if_save: bool):
         item_names = (
@@ -111,15 +177,15 @@ class ReplayBuffer:  # for off-policy, vectorized env
                     buf_item = item[:self.cur_size]
                 else:
                     buf_item = torch.vstack((item[self.p:self.cur_size], item[0:self.p]))
-                file_path = f"{cwd}/replay_buffer_{name}.pt"
-                print(f"| {self.__class__.__name__}: Save {file_path}")
+                file_path = f"{cwd}/replay_buffer_{name}.pth"
+                print(f"| buffer.save_or_load_history(): Save {file_path}")
                 torch.save(buf_item, file_path)
 
-        elif all([os.path.isfile(f"{cwd}/replay_buffer_{name}.pt") for item, name in item_names]):
+        elif all([os.path.isfile(f"{cwd}/replay_buffer_{name}.pth") for item, name in item_names]):
             max_sizes = []
             for item, name in item_names:
-                file_path = f"{cwd}/replay_buffer_{name}.pt"
-                print(f"| {self.__class__.__name__}: Load {file_path}")
+                file_path = f"{cwd}/replay_buffer_{name}.pth"
+                print(f"| buffer.save_or_load_history(): Load {file_path}")
                 buf_item = torch.load(file_path)
 
                 max_size = buf_item.shape[0]
@@ -129,59 +195,43 @@ class ReplayBuffer:  # for off-policy, vectorized env
             self.cur_size = max_sizes[0]
 
 
-class BinarySearchTree:
-    """Binary Search Tree for PER
+class SumTree:
+    """ BinarySearchTree for PER (SumTree)
     Contributor: Github GyChou, Github mississippiu
     Reference: https://github.com/kaixindelele/DRLib/tree/main/algos/pytorch/td3_sp
     Reference: https://github.com/jaromiru/AI-blog/blob/master/SumTree.py
     """
 
-    def __init__(self, memo_len):
-        self.memo_len = memo_len  # replay buffer len
-        self.prob_ary = np.zeros((memo_len - 1) + memo_len)  # parent_nodes_num + leaf_nodes_num
-        self.max_capacity = len(self.prob_ary)
-        self.cur_capacity = self.memo_len - 1  # pointer
-        self.indices = None
-        self.depth = int(np.log2(self.max_capacity))
+    def __init__(self, buf_len: int):
+        self.buf_len = buf_len  # replay buffer len
+        self.max_len = (buf_len - 1) + buf_len  # parent_nodes_num + leaf_nodes_num
+        self.depth = math.ceil(math.log2(self.max_len))
 
-        """
-        PER.  Prioritized Experience Replay. Section 4
-        alpha, beta = 0.7, 0.5 for rank-based variant
-        alpha, beta = 0.6, 0.4 for proportional variant
-        """
-        self.per_alpha = 0.6  # alpha = (Uniform:0, Greedy:1)
-        self.per_beta = 0.4  # beta = (PER:0, NotPER:1)
+        self.tree = torch.zeros(self.max_len, dtype=torch.float32)
 
-    def update_id(self, data_id, prob=10):  # 10 is max_prob
-        tree_id = data_id + self.memo_len - 1
-        if self.cur_capacity == tree_id:
-            self.cur_capacity += 1
+    def update_id(self, data_id: int, prob=10):  # 10 is max_prob
+        tree_id = data_id + self.buf_len - 1
 
-        delta = prob - self.prob_ary[tree_id]
-        self.prob_ary[tree_id] = prob
+        delta = prob - self.tree[tree_id]
+        self.tree[tree_id] = prob
 
-        while tree_id != 0:  # propagate the change through tree
+        for depth in range(self.depth - 2):  # propagate the change through tree
             tree_id = (tree_id - 1) // 2  # faster than the recursive loop
-            self.prob_ary[tree_id] += delta
+            self.tree[tree_id] += delta
 
-    def update_ids(self, data_ids, prob=10):  # 10 is max_prob
-        ids = data_ids + self.memo_len - 1
-        self.cur_capacity += (ids >= self.cur_capacity).sum()
+    def update_ids(self, data_ids: Tensor, prob: Tensor = 10.):  # 10 is max_prob
+        l_ids = data_ids + self.buf_len - 1
 
-        upper_step = self.depth - 1
-        self.prob_ary[ids] = prob  # here, ids means the indices of given children (maybe the right ones or left ones)
-        p_ids = (ids - 1) // 2
+        self.tree[l_ids] = prob
+        for depth in range(self.depth - 2):  # propagate the change through tree
+            p_ids = ((l_ids - 1) // 2).unique()  # parent indices
+            l_ids = p_ids * 2 + 1  # left children indices
+            r_ids = l_ids + 1  # right children indices
+            self.tree[p_ids] = self.tree[l_ids] + self.tree[r_ids]
 
-        while upper_step:  # propagate the change through tree
-            ids = p_ids * 2 + 1  # in this while loop, ids means the indices of the left children
-            self.prob_ary[p_ids] = self.prob_ary[ids] + self.prob_ary[ids + 1]
-            p_ids = (p_ids - 1) // 2
-            upper_step -= 1
+            l_ids = p_ids
 
-        self.prob_ary[0] = self.prob_ary[1] + self.prob_ary[2]
-        # because we take depth-1 upper steps, ps_tree[0] need to be updated alone
-
-    def get_leaf_id(self, v):
+    def get_leaf_id_and_value(self, v) -> Tuple[int, float]:
         """Tree structure and array storage:
         Tree index:
               0       -> storing priority sum
@@ -191,36 +241,31 @@ class BinarySearchTree:
         3  4  5  6    -> storing priority for transitions
         Array type for storing: [0, 1, 2, 3, 4, 5, 6]
         """
-        parent_idx = 0
-        while True:
-            l_idx = 2 * parent_idx + 1  # the leaf's left node
-            r_idx = l_idx + 1  # the leaf's right node
-            if l_idx >= (len(self.prob_ary)):  # reach bottom, end search
-                leaf_idx = parent_idx
-                break
-            else:  # downward search, always search for a higher priority node
-                if v <= self.prob_ary[l_idx]:
-                    parent_idx = l_idx
-                else:
-                    v -= self.prob_ary[l_idx]
-                    parent_idx = r_idx
-        return min(leaf_idx, self.cur_capacity - 2)  # leaf_idx
+        p_id = 0  # the leaf's parent node
 
-    def get_indices_is_weights(self, batch_size, start=None, end=None):
-        self.per_beta = min(1., self.per_beta + 0.001)
+        for depth in range(self.depth - 2):  # propagate the change through tree
+            l_id = min(2 * p_id + 1, self.max_len - 1)  # the leaf's left node
+            r_id = l_id + 1  # the leaf's right node
+            if v <= self.tree[l_id]:
+                p_id = l_id
+            else:
+                v -= self.tree[l_id]
+                p_id = r_id
+        return p_id, self.tree[p_id]  # leaf_id and leaf_value
 
+    def important_sampling(self, batch_size: int, beg: int, end: int, per_beta: float) -> Tuple[Tensor, Tensor]:
         # get random values for searching indices with proportional prioritization
-        values = (rd.rand(batch_size) + np.arange(batch_size)) * (self.prob_ary[0] / batch_size)
+        values = (torch.arange(batch_size) + torch.rand(batch_size)) * (self.tree[0] / batch_size)
 
         # get proportional prioritization
-        leaf_ids = np.array([self.get_leaf_id(v) for v in values])
-        self.indices = leaf_ids - (self.memo_len - 1)
+        leaf_ids, leaf_values = list(zip(*[self.get_leaf_id_and_value(v) for v in values]))
+        leaf_ids = torch.tensor(leaf_ids, dtype=torch.long)
+        leaf_values = torch.tensor(leaf_values, dtype=torch.float32)
 
-        prob_ary = self.prob_ary[leaf_ids] / self.prob_ary[start:end].min()
-        is_weights = np.power(prob_ary, -self.per_beta)  # important sampling weights
-        return self.indices, is_weights
+        indices = leaf_ids - (self.buf_len - 1)
+        assert 0 <= indices.min()
+        assert indices.max() < self.buf_len
 
-    def td_error_update(self, td_error):  # td_error = (q-q).detach_().abs()
-        prob = td_error.squeeze().clamp(1e-6, 10).pow(self.per_alpha)
-        prob = prob.cpu().numpy()
-        self.update_ids(self.indices, prob)
+        prob_ary = leaf_values / self.tree[beg:end].min()
+        weights = torch.pow(prob_ary, -per_beta)
+        return indices, weights
