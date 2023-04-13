@@ -28,7 +28,7 @@ the following advantages:
 - **Efficient**: in many testing cases (e.g., single-GPU/multi-GPU/GPU-cloud), we find it more efficient than [Ray RLlib](https://github.com/ray-project/ray).
 
 - **Stable**: much much much more stable than [Stable Baselines 3](https://github.com/DLR-RM/stable-baselines3) by utilizing various ensemble methods.
-- **Practical**: used in multipe projects ([ElegantRL_Solver](https://github.com/AI4Finance-Foundation/ElegantRL_Solver), [FinRL](https://github.com/AI4Finance-Foundation/FinRL), etc.)
+- **Practical**: used in multipe projects ([ElegantRL_Solver](https://github.com/AI4Finance-Foundation/ElegantRL_Solver), [FinRL](https://github.com/AI4Finance-Foundation/FinRL), and [FinRL-Meta](https://github.com/AI4Finance-Foundation/FinRL-Meta) etc.)
 
 ElegantRL implements the following model-free deep reinforcement learning (DRL) algorithms:
 
@@ -174,7 +174,7 @@ To cite this repository:
 
 ```
 @misc{erl,
-  author = {Liu, Xiao-Yang and Li, Zechu and Wang, Zhaoran and Zheng, Jiahao},
+  author = {Liu, Xiao-Yang and Li, Zechu and Zhu, Ming and Wang, Zhaoran and Zheng, Jiahao},
   title = {{ElegantRL}: Massively Parallel Framework for Cloud-native Deep Reinforcement Learning},
   year = {2021},
   publisher = {GitHub},
