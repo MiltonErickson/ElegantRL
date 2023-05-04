@@ -3,16 +3,13 @@ Overview
 
 One sentence summary: ElegantRL_Solver is a high-performance RL Solver.
 
-We aim to find high-quality optimum, or even (nearly) global optimum, for nonconvex/nonlinear optimizations (continuous variables) and combinatorial optimizations (discrete variables).
-We provide pretrained neural networks to perform real-time inference for nonconvex optimization problems.
+We aim to find high-quality optimum, or even (nearly) global optimum, for nonconvex/nonlinear optimizations (continuous variables) and combinatorial optimizations (discrete variables). We provide pretrained neural networks to perform real-time inference for nonconvex optimization problems, including combinatorial optimization problems.
 
-Benchmark for combinatorial optimization problems.
-
-This project is built on ElegantRL and OpenAI Gym.
+This project is built on [ElegantRL](https://github.com/AI4Finance-Foundation/ElegantRL) and OpenAI Gym.
 
 The following two key technologies are under active development:
   - Massively parallel simuations of gym-environments on GPU, using thousands of CUDA cores and tensor cores.
-  -Podracer scheduling on a GPU cloud, e.g., DGX-2 SuperPod.
+  - Podracer scheduling on a GPU cloud, e.g., DGX-2 SuperPod.
 
 Key references:
   - Mazyavkina, Nina, et al. "Reinforcement learning for combinatorial optimization: A survey." Computers & Operations Research 134 (2021): 105400.
@@ -25,12 +22,14 @@ Key references:
 
 Environments: 
   - MIMO Beamforming in 5G/6G.
+  - Classical NP-Hard problems.
   - Classical Simulation of Quantum Circuits.
   - Compressive Sensing.
   - Portfolio Management.
   - OR-Gym.
 
 File Structure:
+```
 -RLSolver
 -├── optimal
 -|   ├──branch-and-bound.py
@@ -52,17 +51,17 @@ File Structure:
 -    |   └── chip_design
 -    |── rlsolver_learn2optimize
 -    |── rlsolver_mimo_beamforming
--   |── rlsolver_portfolio_management
+-    |── rlsolver_portfolio_management
 -    |── rlsolver_quantum_circuits
 -    └── utils
-
+```
 
 
 **ElegantRL_Solver features high-performance and stability:**
 
 **High-performance**: it can find high-quality optimum, or even (nearly) global optimum.
 
-**Stable**: it leverages computing resource to implement the Hamiltonian-term as an add-on regularization to model-free DRL algorithms. Such an add-on H-term utilizes computing power (can be computed in parallel on GPU) to search for the "minimum-energy state", corresponding to the stable state of a system.
+**Stable**: it leverages computing resource to implement the Hamiltonian-term as an add-on regularization to DRL algorithms. Such an add-on H-term utilizes computing power (can be computed in parallel on GPU) to search for the "minimum-energy state", corresponding to the stable state of a system.
 
 
   
